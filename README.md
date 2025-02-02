@@ -1,7 +1,8 @@
 # mediaScan
-Scan for large media folders from data offloading from cameras to decide if you need to keep it or remove it to clear space.
+Problem: I have large backups of the raw data from the datawrangling from many video and photo projects, the RAW data is not required as many of those projects have been completed. These files are nested deep within project folders. 
+Solution: Scan for large media folders from data offloading from cameras to decide if you need to keep it or remove it to clear space. This script WILL NOT DELETE ANY FILES but will allow you to open the folder and manually do so.
 
-# Media Scanner Application Summary
+# Media Scanner Application Summary (AI generated)
 
 ## Overview
 This script implements a GUI application for scanning and managing media files (photos and videos) from camera folders. It helps users organize, review, and manage media content across different directories.
