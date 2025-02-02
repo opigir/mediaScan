@@ -3,6 +3,16 @@ Problem: I have large backups of the raw data from the datawrangling from many v
 
 Solution: Scan for large media folders and search for camera folder names to decide if you need to keep it or remove it to clear space. This script WILL NOT DELETE ANY FILES but will allow you to open the folder and manually do so.
 
+Folders it searches for:             
+            'DCIM',
+            'PRIVATE',
+            '100EOS',
+            '101EOS',
+            '102EOS',
+            'CANON',
+            'SD_VIDEO',
+            'AVCHD'
+
 # Media Scanner Application Summary (AI generated)
 
 ## Overview
