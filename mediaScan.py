@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, Canvas
 import json
 import os
 from PIL import Image, ImageTk
@@ -132,14 +132,48 @@ class MediaScanner:
         except Exception as e:
             print(f"Error getting media info for {folder_path}: {str(e)}")
         return info
-    
+
+import concurrent.futures
+from functools import partial
+
 class ThumbnailGrid(ttk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.thumbnail_size = 200
         self.padding = 10
         self.thumbnails = []
-        self.thumbnail_folders = ['thumbs', '.thumbs', 'Thumbs', '.Thumbnails']
+        self.photo_references = {}  # Changed to dict to track by filepath
+        
+        # Create thread pool for background loading
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.pending_thumbnails = {}
+        
+        # Try to import rawpy
+        try:
+            import rawpy
+            self.rawpy = rawpy
+            self.has_rawpy = True
+        except ImportError:
+            print("rawpy not found. Install with: pip install rawpy")
+            self.has_rawpy = False
+
+        # Try to import Windows specific libraries
+        try:
+            import win32com.client
+            import win32gui
+            import win32con
+            import win32ui
+            from win32com.shell import shell, shellcon
+            
+            self.win32gui = win32gui
+            self.win32con = win32con
+            self.win32ui = win32ui
+            self.shell = shell
+            self.shellcon = shellcon
+            self.has_shell = True
+        except ImportError:
+            print("pywin32 not found. Install with: pip install pywin32")
+            self.has_shell = False
         
         # Define file type icons
         self.file_icons = {
@@ -157,7 +191,7 @@ class ThumbnailGrid(ttk.Frame):
         }
         
         self.create_widgets()
-        
+
     def create_widgets(self):
         """Create and setup the UI elements"""
         # Create canvas with scrollbar
@@ -181,41 +215,129 @@ class ThumbnailGrid(ttk.Frame):
 
         # Bind mousewheel
         self.bind_mousewheel()
-        
+
     def bind_mousewheel(self):
-        """Bind mousewheel to scrolling"""
         def _on_mousewheel(event):
             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-            
         self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        
-    def clear(self):
-        """Clear all thumbnails"""
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.thumbnails.clear()
 
-    def find_thumbnail(self, image_path):
-        """Try to find an existing thumbnail for the image"""
-        # Check parent directory for thumbnail folders
-        parent_dir = os.path.dirname(image_path)
-        filename = os.path.basename(image_path)
-        
-        # Look for thumbnails in common thumbnail directories
-        for thumb_dir in self.thumbnail_folders:
-            thumb_path = os.path.join(parent_dir, thumb_dir, filename)
-            if os.path.exists(thumb_path):
-                return thumb_path
-                
+    def get_windows_thumbnail(self, file_path):
+        """Try to get thumbnail using Windows Shell"""
+        try:
+            if not self.has_shell:
+                return None
+
+            # Get shell folder and file info
+            flags = self.shellcon.SHGFI_ICON | self.shellcon.SHGFI_LARGEICON | self.shellcon.SHGFI_USEFILEATTRIBUTES
+            file_info = self.shell.SHGetFileInfo(file_path, 0, flags)
+            
+            if not file_info or not file_info[0] or not file_info[0].hIcon:
+                return None
+
+            # Extract icon
+            hicon = file_info[0].hIcon
+            
+            # Create a device context and bitmap
+            dc = self.win32ui.CreateDCFromHandle(self.win32gui.GetDC(0))
+            memdc = dc.CreateCompatibleDC()
+            bitmap = self.win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(dc, self.thumbnail_size, self.thumbnail_size)
+            memdc.SelectObject(bitmap)
+            
+            # Draw icon on bitmap
+            memdc.FillSolidRect((0, 0, self.thumbnail_size, self.thumbnail_size), 0xFFFFFF)
+            self.win32gui.DrawIconEx(
+                memdc.GetHandleOutput(), 
+                0, 0, hicon, 
+                self.thumbnail_size, self.thumbnail_size, 
+                0, None, 0x0003
+            )
+            
+            # Convert to PIL Image
+            bmpstr = bitmap.GetBitmapBits(True)
+            img = Image.frombuffer(
+                'RGBA',
+                (self.thumbnail_size, self.thumbnail_size),
+                bmpstr, 'raw', 'BGRA', 0, 1
+            )
+            
+            # Clean up
+            self.win32gui.DestroyIcon(hicon)
+            bitmap.DeleteObject()
+            memdc.DeleteDC()
+            dc.DeleteDC()
+            
+            return img
+
+        except Exception as e:
+            print(f"Error getting Windows thumbnail for {file_path}: {str(e)}")
+            return None
+
+    def get_embedded_thumbnail(self, file_path):
+        """Try to extract embedded JPEG thumbnail from RAW file"""
+        try:
+            if not self.has_rawpy:
+                return None
+
+            with self.rawpy.imread(file_path) as raw:
+                try:
+                    thumb = raw.extract_thumb()
+                    if thumb.format == self.rawpy.ThumbFormat.JPEG:
+                        from io import BytesIO
+                        img = Image.open(BytesIO(thumb.data))
+                        img.thumbnail((self.thumbnail_size, self.thumbnail_size))
+                        return img.copy()
+                except:
+                    return None
+        except Exception as e:
+            print(f"Error extracting thumbnail from {file_path}: {str(e)}")
         return None
 
-    def get_file_type(self, filename):
-        """Determine file type based on extension"""
-        ext = os.path.splitext(filename.lower())[1]
-        for ftype, extensions in self.file_types.items():
-            if ext in extensions:
-                return ftype
-        return 'unknown'
+    def get_pil_thumbnail(self, file_path):
+        """Create thumbnail from file using PIL as last resort"""
+        try:
+            with Image.open(file_path) as img:
+                img.thumbnail((self.thumbnail_size, self.thumbnail_size))
+                return img.copy()
+        except Exception as e:
+            print(f"Error creating PIL thumbnail for {file_path}: {str(e)}")
+            return None
+
+    def update_thumbnail(self, file_path, img):
+        """Update thumbnail in the UI from background thread"""
+        if file_path not in self.pending_thumbnails:
+            return
+        
+        label = self.pending_thumbnails[file_path]
+        if not label.winfo_exists():
+            return
+            
+        try:
+            photo = ImageTk.PhotoImage(img)
+            self.photo_references[file_path] = photo
+            label.configure(image=photo)
+        except Exception as e:
+            print(f"Error updating thumbnail for {file_path}: {str(e)}")
+
+    def load_thumbnail_async(self, file_path, label):
+        """Load thumbnail in background thread"""
+        ext = os.path.splitext(file_path.lower())[1]
+        img = None
+        
+        # Try Windows thumbnail first for all files
+        img = self.get_windows_thumbnail(file_path)
+        
+        if not img:
+            # If Windows failed and it's a RAW file, try embedded JPEG
+            if ext in self.file_types['raw']:
+                img = self.get_embedded_thumbnail(file_path)
+            # For regular images, try PIL as last resort
+            elif ext in self.file_types['image']:
+                img = self.get_pil_thumbnail(file_path)
+                
+        if img:
+            # Schedule update in main thread
+            self.after(0, lambda: self.update_thumbnail(file_path, img))
 
     def add_thumbnail(self, file_path, row, col):
         """Add a thumbnail or filename to the grid"""
@@ -223,28 +345,163 @@ class ThumbnailGrid(ttk.Frame):
             thumb_frame = ttk.Frame(self.scrollable_frame)
             thumb_frame.grid(row=row, column=col, padx=5, pady=5)
             
-            # Get file type and corresponding icon
-            file_type = self.get_file_type(file_path)
-            icon = self.file_icons.get(file_type, self.file_icons['unknown'])
+            # Get file extension and type
+            ext = os.path.splitext(file_path.lower())[1]
             
             # Create placeholder with icon
-            placeholder = ttk.Frame(thumb_frame, width=self.thumbnail_size, height=100)
-            placeholder.pack()
-            placeholder.pack_propagate(False)
+            if ext in self.file_types['raw']:
+                icon = self.file_icons['raw']
+            elif ext in self.file_types['image']:
+                icon = self.file_icons['image']
+            elif ext in self.file_types['video']:
+                icon = self.file_icons['video']
+            else:
+                icon = self.file_icons['unknown']
             
-            icon_label = ttk.Label(placeholder, text=icon, font=('Arial', 24))
-            icon_label.pack(pady=10)
+            # Create label that will be updated with thumbnail
+            label = ttk.Label(thumb_frame, text=icon, font=('Arial', 24))
+            label.pack(pady=5)
+            
+            # Start background loading if it's an image or raw file
+            if ext in self.file_types['image'] or ext in self.file_types['raw']:
+                self.pending_thumbnails[file_path] = label
+                self.executor.submit(self.load_thumbnail_async, file_path, label)
             
             # Show filename and extension
             filename = os.path.basename(file_path)
-            ext = os.path.splitext(filename)[1].upper()
             name_label = ttk.Label(thumb_frame, 
-                                 text=f"{filename}\n{ext}",
+                                 text=f"{filename}\n{ext.upper()}",
                                  wraplength=self.thumbnail_size)
             name_label.pack()
             
         except Exception as e:
             print(f"Error creating thumbnail for {file_path}: {str(e)}")
+            
+    def clear(self):
+        """Clear all thumbnails"""
+        self.pending_thumbnails.clear()
+        self.photo_references.clear()
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.thumbnails.clear()
+
+    def destroy(self):
+        """Clean up resources when widget is destroyed"""
+        self.executor.shutdown(wait=False)
+        super().destroy()
+
+# class ThumbnailGrid(ttk.Frame):
+#     def __init__(self, parent, **kwargs):
+#         super().__init__(parent, **kwargs)
+#         self.thumbnail_size = 200
+#         self.padding = 10
+#         self.thumbnails = []
+#         self.thumbnail_folders = ['thumbs', '.thumbs', 'Thumbs', '.Thumbnails']
+        
+#         # Define file type icons
+#         self.file_icons = {
+#             'image': '📷',
+#             'video': '🎥',
+#             'raw': '📸',
+#             'unknown': '📄'
+#         }
+        
+#         # Define file extensions for each type
+#         self.file_types = {
+#             'image': {'.jpg', '.jpeg', '.png', '.gif', '.bmp'},
+#             'video': {'.mp4', '.mov', '.avi', '.mts', '.m2ts'},
+#             'raw': {'.cr2', '.cr3', '.nef', '.arw', '.raw', '.dng'}
+#         }
+        
+#         self.create_widgets()
+        
+#     def create_widgets(self):
+#         """Create and setup the UI elements"""
+#         # Create canvas with scrollbar
+#         self.canvas = Canvas(self, bg='white')
+#         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+#         self.scrollable_frame = ttk.Frame(self.canvas)
+
+#         # Configure canvas
+#         self.scrollable_frame.bind(
+#             "<Configure>",
+#             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+#         )
+        
+#         # Create scrollable window
+#         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+#         self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+#         # Pack scrollbar and canvas
+#         self.scrollbar.pack(side="right", fill="y")
+#         self.canvas.pack(side="left", fill="both", expand=True)
+
+#         # Bind mousewheel
+#         self.bind_mousewheel()
+        
+#     def bind_mousewheel(self):
+#         """Bind mousewheel to scrolling"""
+#         def _on_mousewheel(event):
+#             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            
+#         self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+#     def clear(self):
+#         """Clear all thumbnails"""
+#         for widget in self.scrollable_frame.winfo_children():
+#             widget.destroy()
+#         self.thumbnails.clear()
+
+#     def find_thumbnail(self, image_path):
+#         """Try to find an existing thumbnail for the image"""
+#         # Check parent directory for thumbnail folders
+#         parent_dir = os.path.dirname(image_path)
+#         filename = os.path.basename(image_path)
+        
+#         # Look for thumbnails in common thumbnail directories
+#         for thumb_dir in self.thumbnail_folders:
+#             thumb_path = os.path.join(parent_dir, thumb_dir, filename)
+#             if os.path.exists(thumb_path):
+#                 return thumb_path
+                
+#         return None
+
+#     def get_file_type(self, filename):
+#         """Determine file type based on extension"""
+#         ext = os.path.splitext(filename.lower())[1]
+#         for ftype, extensions in self.file_types.items():
+#             if ext in extensions:
+#                 return ftype
+#         return 'unknown'
+
+#     def add_thumbnail(self, file_path, row, col):
+#         """Add a thumbnail or filename to the grid"""
+#         try:
+#             thumb_frame = ttk.Frame(self.scrollable_frame)
+#             thumb_frame.grid(row=row, column=col, padx=5, pady=5)
+            
+#             # Get file type and corresponding icon
+#             file_type = self.get_file_type(file_path)
+#             icon = self.file_icons.get(file_type, self.file_icons['unknown'])
+            
+#             # Create placeholder with icon
+#             placeholder = ttk.Frame(thumb_frame, width=self.thumbnail_size, height=100)
+#             placeholder.pack()
+#             placeholder.pack_propagate(False)
+            
+#             icon_label = ttk.Label(placeholder, text=icon, font=('Arial', 24))
+#             icon_label.pack(pady=10)
+            
+#             # Show filename and extension
+#             filename = os.path.basename(file_path)
+#             ext = os.path.splitext(filename)[1].upper()
+#             name_label = ttk.Label(thumb_frame, 
+#                                  text=f"{filename}\n{ext}",
+#                                  wraplength=self.thumbnail_size)
+#             name_label.pack()
+            
+#         except Exception as e:
+#             print(f"Error creating thumbnail for {file_path}: {str(e)}")
 
 class MediaManager:
     def __init__(self, root):
@@ -278,6 +535,13 @@ class MediaManager:
         self.main_frame.add(self.right_panel, weight=1)
 
         # Setup folder list (left panel)
+        # Add total size label at the top of folder list
+        self.total_size_var = tk.StringVar(value="Total Size: 0 GB")
+        total_size_label = ttk.Label(self.folder_list_frame, 
+                                   textvariable=self.total_size_var,
+                                   font=('Arial', 10))
+        total_size_label.pack(pady=(0, 5), padx=5, anchor='w')
+
         folder_list_label = ttk.Label(self.folder_list_frame, text="Folders", font=('Arial', 11, 'bold'))
         folder_list_label.pack(pady=5, padx=5, anchor='w')
 
@@ -412,6 +676,11 @@ class MediaManager:
         self.folder_list.delete(*self.folder_list.get_children())
         
         if hasattr(self, 'data') and self.data.get('folders'):
+            # Calculate total size
+            total_size_mb = sum(folder['size_mb'] for folder in self.data['folders'])
+            total_size_gb = total_size_mb / 1024
+            self.total_size_var.set(f"Total Size: {total_size_gb:.2f} GB")
+
             for idx, folder in enumerate(self.data['folders']):
                 # Create folder display text
                 folder_text = f"{folder['name']} ({folder['size_mb']:.1f}MB)"
